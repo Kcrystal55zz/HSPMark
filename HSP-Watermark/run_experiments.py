@@ -17,12 +17,15 @@ import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList, MBartForConditionalGeneration
 from sklearn.metrics import roc_curve, auc
 import evaluate
+import torch.nn.functional as F
 
 transformers.logging.set_verbosity_error()
 
-from core.utils_crypto import generate_private_key, encode_message, decode_message
-from core.hsp_processor import HSPWatermarkLogitsProcessor
-from core.hsp_detector import HSPWatermarkDetector
+# 引入全新的上下文感知动态水印模块
+from core.hsp_processor import ContextAwareHSPLogitsProcessor
+from core.hsp_detector import ContextAwareHSPDetector
+from core.train_mlp_with_llm import ContextAwareWatermarkNet
+
 from evaluation.attack_perturb import PerturbationAttacker
 from evaluation.attack_paraphrase import ParaphraseAttacker
 
@@ -40,7 +43,7 @@ CONFIG = {
         "summarization": "./datasets/cnn_articles.json",
         "translation": "./datasets/wmt_en.json"         
     },
-    "capacities": [24, 36], 
+    "capacities": [16, 24], # 测试的比特容量，需对应训练好不同的 MLP 权重
     "alpha": 2.0
 }
 
@@ -69,14 +72,6 @@ class MetricsEvaluator:
         bs_out = self.bertscore.compute(predictions=preds, references=refs, lang="en")
         results['BERTScore'] = np.mean(bs_out['f1'])
         return results
-
-def compute_detection_metrics(watermarked_scores: list, clean_scores: list):
-    y_true = [1] * len(watermarked_scores) + [0] * len(clean_scores)
-    y_scores = watermarked_scores + clean_scores
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-    roc_auc = auc(fpr, tpr)
-    tpr_at_1_fpr = tpr[np.where(fpr <= 0.01)[0][-1]] if len(np.where(fpr <= 0.01)[0]) > 0 else 0.0
-    return {"AUC": roc_auc, "TPR@1%FPR": tpr_at_1_fpr}
 
 def prepare_local_prompts(task: str, num_samples: int, tokenizer, max_prompt_length: int = 50) -> list:
     prompts = []
@@ -176,82 +171,97 @@ def run_evaluation_pipeline(args):
             
         model.eval()
         
-        dataset_prompts = prepare_local_prompts(task, args.num_samples, tokenizer)
+        # 确定底层 Backbone (用于提取 Hidden States)
+        llm_backbone = getattr(model, "model", getattr(model, "transformer", getattr(model, "get_decoder", lambda: model)()))
         
-        # 设定有效样本过滤阈值（例如要求生成长度大于等于目标长度的 75%）
+        # 统一把词表转为 float32
+        embeddings_weight = F.normalize(embeddings_weight, p=2, dim=-1).to(torch.float32)
+        HIDDEN_DIM = embeddings_weight.shape[1]
+        SEMANTIC_DIM = HIDDEN_DIM
+        
+        dataset_prompts = prepare_local_prompts(task, args.num_samples, tokenizer)
         filter_threshold = int(args.token_length * 0.75) 
 
         for capacity in CONFIG["capacities"]:
-            p_matrix = generate_private_key(embeddings_weight.shape[1], capacity, device=CONFIG["device"])
-            p_matrix = p_matrix.to(embeddings_weight.dtype)
-            detector = HSPWatermarkDetector(embeddings_weight, p_matrix)
+            # 【重要修改】：不同 capacity 需要加载其对应的 MLP 权重
+            mlp_net = ContextAwareWatermarkNet(SEMANTIC_DIM, capacity, HIDDEN_DIM).to(CONFIG["device"])
+            weight_path = f"core/context_aware_watermark_mlp_{capacity}b.pth"
+            if os.path.exists(weight_path):
+                mlp_net.load_state_dict(torch.load(weight_path, map_location=CONFIG["device"]))
+                print(f"[+] 成功加载水印网络权重: {weight_path}")
+            else:
+                print(f"[!] 警告: 未找到 {weight_path}，使用随机初始化权重（仅作代码演示）")
+                
+            detector = ContextAwareHSPDetector(mlp_net, llm_backbone, tokenizer, embeddings_weight)
             
             print(f"\n--- [Task: {task} | Cap: {capacity}bits | Target Length: {args.token_length}tokens] ---")
             result_file = f"results/exp_{task}_{capacity}b_{args.token_length}t.jsonl"
             print(f"[*] 详细数据将实时保存至: {result_file}")
-            print(f"[*] 注意: 最终计算平均指标时，将只统计生成真实 Token 数量 >= {filter_threshold} 的有效样本。")
             
-            # 用于记录所有明细的数组
             all_results = []
             
             with open(result_file, "w", encoding="utf-8") as f_out:
                 for idx, prompt in enumerate(dataset_prompts):
                     print(f"  -> [Sample {idx+1}/{len(dataset_prompts)}] Generating & Attacking...")
                     
+                    # 1. 随机生成 0/1 数组，并转化为 MLP 需要的 [-1, 1] 浮点张量
                     original_bits = torch.randint(0, 2, (capacity,)).tolist()
-                    msg_tensor = encode_message(original_bits, device=CONFIG["device"])
-                    msg_tensor = msg_tensor.to(embeddings_weight.dtype)
+                    msg_tensor = torch.tensor([1.0 if b == 1 else -1.0 for b in original_bits], device=CONFIG["device"], dtype=torch.float32)
                     
                     input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(CONFIG["device"])
                     
-                    # 🌟 修复: 移除强迫模型生成废话的 min_new_tokens，允许模型自然结束
                     gen_kwargs = {
                         "max_new_tokens": args.token_length, 
                         "do_sample": True, 
                         "top_p": 0.9,
                         "temperature": 0.8,
-                        "repetition_penalty": 1.2, # 保持重复惩罚
+                        "repetition_penalty": 1.2, 
                         "pad_token_id": tokenizer.eos_token_id
                     }
                     if task == "translation":
                         gen_kwargs["forced_bos_token_id"] = tokenizer.lang_code_to_id["ro_RO"]
                     
+                    # 生成 Baseline 干净文本
                     with torch.no_grad():
                         clean_out = model.generate(input_ids, **gen_kwargs)
                         clean_ids = clean_out[0, input_ids.shape[1]:] if task == "generation" else clean_out[0, 1:]
                         clean_text = tokenizer.decode(clean_ids, skip_special_tokens=True)
-                        _, clean_score = detector.detect(clean_ids)
-                        clean_detect_score_val = torch.norm(clean_score).item()
                     
-                    hsp_processor = HSPWatermarkLogitsProcessor(embeddings_weight, msg_tensor, p_matrix, alpha=CONFIG["alpha"])
+                    # 生成 Watermark 文本 (加入 MLP Processor)
+                    hsp_processor = ContextAwareHSPLogitsProcessor(mlp_net, llm_backbone, msg_tensor, embeddings_weight, alpha=CONFIG["alpha"])
                     gen_kwargs["logits_processor"] = LogitsProcessorList([hsp_processor])
+                    
                     with torch.no_grad():
                         wm_out = model.generate(input_ids, **gen_kwargs)
                         wm_ids = wm_out[0, input_ids.shape[1]:] if task == "generation" else wm_out[0, 1:]
                         wm_text = tokenizer.decode(wm_ids, skip_special_tokens=True)
                         
+                    # 计算 PPL 困惑度
                     clean_ppl_val, wm_ppl_val = 0.0, 0.0
                     if task == "generation":
                         clean_ppl_val = evaluator.calc_ppl(model, clean_out)
                         wm_ppl_val = evaluator.calc_ppl(model, wm_out)
                         
-                    extracted_msg, wm_score = detector.detect(wm_ids)
-                    wm_detect_score_val = torch.norm(wm_score).item()
+                    # 2. O(1) 盲提取原始文本的水印
+                    extracted_msg = detector.extract_message(wm_text, capacity)
+                    extracted_bits = [1 if x > 0 else 0 for x in extracted_msg.squeeze().tolist()]
+                    bit_acc_clean = sum([1 for e, o in zip(extracted_bits, original_bits) if e == o]) / capacity
                     
-                    extracted_bits = decode_message(extracted_msg)
-                    bit_acc_clean = 1.0 - (sum([1 for e, o in zip(extracted_bits, original_bits) if e != o]) / capacity)
-                    
+                    # 3. 截断攻击 (Drop Attack) 及提取
                     crop_ids = perturb_attacker.attack_drop(wm_ids.tolist(), drop_ratio=0.3)
-                    crop_extracted, _ = detector.detect(torch.tensor(crop_ids, device=CONFIG["device"]))
-                    bit_acc_crop = 1.0 - (sum([1 for e, o in zip(decode_message(crop_extracted), original_bits) if e != o]) / capacity)
+                    crop_text = tokenizer.decode(crop_ids, skip_special_tokens=True)
+                    crop_extracted = detector.extract_message(crop_text, capacity)
+                    crop_extracted_bits = [1 if x > 0 else 0 for x in crop_extracted.squeeze().tolist()]
+                    bit_acc_crop = sum([1 for e, o in zip(crop_extracted_bits, original_bits) if e == o]) / capacity
 
+                    # 4. 同义改写攻击 (Paraphrase Attack) 及提取
                     bit_acc_para = 0.0
                     para_text = ""
                     if para_attacker is not None:
                         para_text = para_attacker.attack(wm_text)
-                        para_ids = tokenizer(para_text, return_tensors="pt").input_ids[0].to(CONFIG["device"])
-                        para_extracted, _ = detector.detect(para_ids)
-                        bit_acc_para = 1.0 - (sum([1 for e, o in zip(decode_message(para_extracted), original_bits) if e != o]) / capacity)
+                        para_extracted = detector.extract_message(para_text, capacity)
+                        para_extracted_bits = [1 if x > 0 else 0 for x in para_extracted.squeeze().tolist()]
+                        bit_acc_para = sum([1 for e, o in zip(para_extracted_bits, original_bits) if e == o]) / capacity
 
                     actual_generated_tokens = len(wm_ids)
                     
@@ -262,11 +272,9 @@ def run_evaluation_pipeline(args):
                         "clean_text": clean_text,
                         "watermarked_text": wm_text,
                         "paraphrased_text": para_text,
-                        "generated_tokens": actual_generated_tokens, # 这是真实的生成长度
+                        "generated_tokens": actual_generated_tokens,
                         "clean_ppl": round(clean_ppl_val, 4),
                         "wm_ppl": round(wm_ppl_val, 4),
-                        "clean_detect_score": round(clean_detect_score_val, 4),
-                        "wm_detect_score": round(wm_detect_score_val, 4),
                         "bit_acc_clean": bit_acc_clean,
                         "bit_acc_drop30": bit_acc_crop,
                         "bit_acc_paraphrase": bit_acc_para
@@ -275,18 +283,15 @@ def run_evaluation_pipeline(args):
                     f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
                     f_out.flush()
 
-            # 🌟 修复: 筛选有效样本计算平均值
             valid_results = [r for r in all_results if r["generated_tokens"] >= filter_threshold]
             num_valid = len(valid_results)
             
-            print(f"\n=== [全局指标汇总 Task: {task} | 有效样本: {num_valid}/{len(all_results)}] ===")
+            print(f"\n=== [全局指标汇总 Task: {task} | Cap: {capacity}b | 有效样本: {num_valid}/{len(all_results)}] ===")
             
             if num_valid == 0:
                 print("    [!] 警告：没有达到长度阈值的样本，无法计算有效平均值。")
                 continue
                 
-            wm_detect_scores = [r["wm_detect_score"] for r in valid_results]
-            clean_detect_scores = [r["clean_detect_score"] for r in valid_results]
             bit_acc_clean_list = [r["bit_acc_clean"] for r in valid_results]
             bit_acc_copy_list = [r["bit_acc_drop30"] for r in valid_results]
             bit_acc_para_list = [r["bit_acc_paraphrase"] for r in valid_results]
@@ -301,12 +306,9 @@ def run_evaluation_pipeline(args):
                 quality = evaluator.calc_text_quality(wm_texts, clean_texts, task)
                 print(f"    [文本质量] " + ", ".join([f"{k}: {v:.4f}" for k, v in quality.items()]))
             
-            det_metrics = compute_detection_metrics(wm_detect_scores, clean_detect_scores)
-            print(f"    [检测能力] AUC: {det_metrics['AUC']: .4f} | TPR@1%FPR: {det_metrics['TPR@1%FPR']: .4f}")
-            
-            res_str = f"    [平均鲁棒性] Clean Acc: {np.mean(bit_acc_clean_list)*100:.2f}% | Drop Acc: {np.mean(bit_acc_copy_list)*100:.2f}%"
+            res_str = f"    [平均比特准确率] 无攻击 Acc: {np.mean(bit_acc_clean_list)*100:.2f}% | 删减攻击 Acc: {np.mean(bit_acc_copy_list)*100:.2f}%"
             if para_attacker is not None:
-                res_str += f" | Paraphrase Acc: {np.mean(bit_acc_para_list)*100:.2f}%"
+                res_str += f" | 改写攻击 Acc: {np.mean(bit_acc_para_list)*100:.2f}%"
             print(res_str)
                 
         del model
@@ -314,7 +316,7 @@ def run_evaluation_pipeline(args):
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HSP-Watermark Top-Tier Evaluation Engine")
+    parser = argparse.ArgumentParser(description="Context-Aware Multi-bit HSP Evaluation Engine")
     parser.add_argument("--task", type=str, default="generation", choices=["generation", "summarization", "translation", "all"])
     parser.add_argument("--paraphrase_model", type=str, default="none", choices=["none", "dipper", "pegasus"])
     parser.add_argument("--num_samples", type=int, default=5)
