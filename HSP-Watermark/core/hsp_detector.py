@@ -1,43 +1,61 @@
 import torch
-from typing import Tuple
+import torch.nn.functional as F
 
-class HSPWatermarkDetector:
-    def __init__(self, embeddings_weight: torch.Tensor, p_matrix: torch.Tensor):
-        """
-        全息语义投影水印提取器。
-        采用全局平均池化，天生具备免同步(Synchronization-Free)和抗增删(Deletion-Resilient)特性。
+class ContextAwareHSPDetector:
+    def __init__(self, mlp_net, llm_backbone, llm_tokenizer, embeddings_weight):
+        self.mlp_net = mlp_net
+        self.llm_backbone = llm_backbone
+        self.llm_tokenizer = llm_tokenizer
+        self.embeddings = embeddings_weight.to(torch.float32)
         
-        :param embeddings_weight: 语言模型的 Embedding 权重 [vocab_size, hidden_dim]
-        :param p_matrix: 与生成时一致的私钥矩阵 [hidden_dim, message_length]
-        """
-        self.embeddings = embeddings_weight
-        self.p_matrix = p_matrix
+        self.mlp_net.eval()
+        self.llm_backbone.eval()
 
-    def detect(self, input_ids: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def extract_message(self, text: str, message_dim: int, min_prefix_len=5):
         """
-        从被检测文本的 Token IDs 中提取多比特水印信息。
-        
-        :param input_ids: 待测文本的 Token IDs 序列 [sequence_length]
-        :return: (提取的极性张量 [-1, 1], 原始反投影浮点得分)
+        优雅盲提取：利用生成时的自然分布假定，反向榨取多比特信息。
+        :param text: 待测文本
+        :param message_dim: 提取的秘钥比特长度
+        :return: 提取出的比特张量 [-1, 1]
         """
-        # 确保张量在同一设备
-        device = self.embeddings.device
-        input_ids = input_ids.to(device)
-        self.p_matrix = self.p_matrix.to(device)
+        device = next(self.mlp_net.parameters()).device
+        input_ids = self.llm_tokenizer.encode(text, return_tensors="pt")[0].to(device)
+        total_tokens = len(input_ids)
         
-        # 1. 查找文本中所有词的 Embedding 向量 [sequence_length, hidden_dim]
-        text_embeds = self.embeddings[input_ids]
-        
-        # 2. 全局平均池化，获取该段文本的宏观语义向量 [hidden_dim]
-        e_doc = torch.mean(text_embeds, dim=0)
-        
-        # 3. 反向投影，通过私钥矩阵解密得分 [message_length]
-        extracted_scores = torch.matmul(e_doc, self.p_matrix)
-        
-        # 4. 取符号恢复极性信息
-        extracted_message = torch.sign(extracted_scores)
-        
-        # 处理恰好为 0 的边界情况（默认归为 1）
+        if total_tokens <= min_prefix_len: 
+            return torch.ones(1, message_dim).to(device)
+
+        extracted_scores = torch.zeros(1, message_dim).to(device)
+        valid_tokens_count = 0
+
+        with torch.no_grad():
+            # 提前拿全词表对应的词向量
+            text_embeds = self.embeddings[input_ids]
+
+            for t in range(min_prefix_len, total_tokens):
+                # 1. 拿到当前词对应的上下文
+                prefix_ids = input_ids[:t].unsqueeze(0)
+                sem = self.llm_backbone(prefix_ids).last_hidden_state[:, -1, :].to(torch.float32)
+                sem = F.normalize(sem, p=2, dim=-1)
+
+                # 2. MLP 算出当时的动态投影矩阵 P_t [hidden_dim, message_dim]
+                P_t = self.mlp_net(sem).squeeze(0) 
+
+                # 3. 拿到该位置上 真实生成的词的 Embedding [hidden_dim]
+                token_embed = text_embeds[t] 
+
+                # 4. 关键：反向映射，直接拿词向量与 P_t 相乘得到碎片信息 m_t [message_dim]
+                token_msg_score = torch.matmul(token_embed.unsqueeze(0), P_t)
+                
+                extracted_scores += token_msg_score
+                valid_tokens_count += 1
+
+        if valid_tokens_count == 0:
+            return torch.ones(1, message_dim).to(device)
+
+        # 5. 全局平均汇总，恢复比特极性
+        avg_scores = extracted_scores / valid_tokens_count
+        extracted_message = torch.sign(avg_scores)
         extracted_message[extracted_message == 0] = 1.0 
         
-        return extracted_message, extracted_scores
+        return extracted_message
