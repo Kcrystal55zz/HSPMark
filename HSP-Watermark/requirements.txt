@@ -1,0 +1,16 @@
+# Deep Learning & Tensor Operations
+torch>=2.0.0
+numpy>=1.21.0
+
+# HuggingFace Ecosystem (Models & Tokenizers)
+transformers>=4.31.0
+datasets>=2.14.0
+accelerate>=0.21.0
+sentencepiece>=0.1.99
+
+# Evaluation & Metrics
+evaluate>=0.4.0
+scikit-learn>=1.2.0
+rouge_score>=0.1.2
+bert_score>=0.3.13
+sacrebleu>=2.3.1
