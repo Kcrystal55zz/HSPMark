@@ -1,5 +1,8 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 🔥 修复显存碎片
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import json
 import torch
 import math
@@ -19,9 +22,9 @@ def parse_args():
     parser.add_argument("--output_log", type=str, default="results/experiment_log.jsonl")
     
     # --- 攻击配置 ---
-    parser.add_argument("--attack_type", type=str, default="pegasus", choices=["dipper", "pegasus", "none"], help="使用的改写模型类型")
-    parser.add_argument("--paraphraser_path", type=str, default="/root/models/pegasus-large", help="改写模型的本地或HF路径")
-    parser.add_argument("--drop_ratio", type=float, default=0.3, help="删词攻击的比例")
+    parser.add_argument("--attack_type", type=str, default="dipper", choices=["dipper", "pegasus", "none"], help="使用的改写模型类型")
+    parser.add_argument("--paraphraser_path", type=str, default="/root/autodl-tmp/huggingface_models/kalpeshk2011-dipper-paraphraser-xxl", help="/root/autodl-tmp/huggingface_models/kalpeshk2011-dipper-paraphraser-xxl /root/models/pegasus-large")
+    parser.add_argument("--drop_ratio", type=float, default=0.1, help="删词攻击的比例")
     
     # DIPPER 专用参数
     parser.add_argument("--lex_diversity", type=int, default=20, help="DIPPER: 词汇多样性 (0-100)")
@@ -32,8 +35,8 @@ def parse_args():
     
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--max_new_tokens", type=int, default=100)
-    parser.add_argument("--bit_dim", type=int, default=16)
-    parser.add_argument("--alpha", type=float, default=2.5)
+    parser.add_argument("--bit_dim", type=int, default=8)
+    parser.add_argument("--alpha", type=float, default=2)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -67,8 +70,16 @@ def main():
 
     print("Loading Generative LLM...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    llm = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    # 🔥 修复3：Llama加载半精度，大幅节省显存
+    llm = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        dtype=torch.bfloat16,
+        device_map="auto"
+    ).to(device)
     llm.eval()
+    
+    # 清理显存缓存
+    torch.cuda.empty_cache()
     
     # 初始化独立的攻击模块
     attacker = TextAttacker(
@@ -101,71 +112,110 @@ def main():
     total_acc_para = 0.0
     total_ppl_wm, total_ppl_base, valid_ppl_count = 0.0, 0.0, 0
 
+    # ===================== 新增：有效样本计数 =====================
+    valid_sample_count = 0
+
     for i, prompt in enumerate(tqdm(prompts, desc=f"Evaluating {args.bit_dim}-bits")):
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        prompt_len = len(prompt)
+        prompt_token_len = inputs.input_ids.size(1)  # ✅ prompt 的 token 数
         
         # [A] 生成 Baseline
         with torch.no_grad():
             outputs_base = llm.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=True, top_p=args.top_p, temperature=args.temperature, pad_token_id=tokenizer.eos_token_id)
             base_full = tokenizer.decode(outputs_base[0], skip_special_tokens=True)
-            clean_text = base_full[prompt_len:].strip()
             
         # [B] 生成 Watermarked
         watermark_processor = SemanticOrthogonalLogitsProcessor(sent_model, mlp, tokenizer, secret_message, args.alpha, args.top_k)
         with torch.no_grad():
             outputs_wm = llm.generate(**inputs, max_new_tokens=args.max_new_tokens, logits_processor=LogitsProcessorList([watermark_processor]), do_sample=True, top_p=args.top_p, temperature=args.temperature, pad_token_id=tokenizer.eos_token_id)
             wm_full = tokenizer.decode(outputs_wm[0], skip_special_tokens=True)
-            wm_text = wm_full[prompt_len:].strip()
-        
-        # [C] 提取 Clean 准确率与计算 PPL
-        acc_clean = (detector.extract_message(wm_full) == secret_message).sum().item() / args.bit_dim
-        total_acc_clean += acc_clean
-        
-        ppl_base = calculate_ppl(llm, tokenizer, prompt, base_full, device)
-        ppl_wm = calculate_ppl(llm, tokenizer, prompt, wm_full, device)
-        if not math.isnan(ppl_base) and not math.isnan(ppl_wm):
-            total_ppl_base += ppl_base
-            total_ppl_wm += ppl_wm
-            valid_ppl_count += 1
 
-        # [D] Drop 攻击
-        dropped_text = attacker.simulate_drop_attack(wm_text, drop_ratio=args.drop_ratio)
-        acc_drop = (detector.extract_message(prompt + " " + dropped_text) == secret_message).sum().item() / args.bit_dim
-        total_acc_drop += acc_drop
+        # ===================== 核心修改 =====================
+        # ✅ 计算实际生成的 token 数量
+        actual_generated_tokens = outputs_wm.size(1) - prompt_token_len
 
-        # [E] Paraphrase 改写攻击
-        paraphrased_text = attacker.paraphrase(
-            wm_text, 
-            lex_diversity=args.lex_diversity, 
-            order_diversity=args.order_diversity,
-            temperature=args.para_temperature
-        )
-        
+        # ✅ 判断是否满足最小长度要求
+        min_required_tokens = int(args.max_new_tokens * 0.75)
+        is_valid_sample = actual_generated_tokens >= min_required_tokens
+
+        # ===================== 提取文本 =====================
+        clean_text = tokenizer.decode(outputs_base[0][prompt_token_len:], skip_special_tokens=True)
+        wm_text = tokenizer.decode(outputs_wm[0][prompt_token_len:], skip_special_tokens=True)
+
+        # ===================== 初始化指标 =====================
+        acc_clean = 0.0
+        acc_drop = 0.0
         acc_para = 0.0
-        if paraphrased_text:
-            acc_para = (detector.extract_message(prompt + " " + paraphrased_text) == secret_message).sum().item() / args.bit_dim
-        total_acc_para += acc_para
+        ppl_base = float('nan')
+        ppl_wm = float('nan')
+        dropped_text = ""
+        paraphrased_text = ""
 
-        # 保存日志
+        # ===================== 只有有效样本才计算指标 =====================
+        if is_valid_sample:
+            # [C] 提取 Clean 准确率与计算 PPL
+            acc_clean = (detector.extract_message(wm_full) == secret_message).sum().item() / args.bit_dim
+            total_acc_clean += acc_clean
+            
+            ppl_base = calculate_ppl(llm, tokenizer, prompt, base_full, device)
+            ppl_wm = calculate_ppl(llm, tokenizer, prompt, wm_full, device)
+            if not math.isnan(ppl_base) and not math.isnan(ppl_wm):
+                total_ppl_base += ppl_base
+                total_ppl_wm += ppl_wm
+                valid_ppl_count += 1
+
+            # [D] Drop 攻击
+            dropped_text = attacker.simulate_drop_attack(wm_text, drop_ratio=args.drop_ratio)
+            acc_drop = (detector.extract_message(prompt + " " + dropped_text) == secret_message).sum().item() / args.bit_dim
+            total_acc_drop += acc_drop
+
+            # [E] Paraphrase 改写攻击
+            paraphrased_text = attacker.paraphrase(
+                wm_text, 
+                lex_diversity=args.lex_diversity, 
+                order_diversity=args.order_diversity,
+                temperature=args.para_temperature
+            )
+            
+            if paraphrased_text:
+                acc_para = (detector.extract_message(prompt + " " + paraphrased_text) == secret_message).sum().item() / args.bit_dim
+            total_acc_para += acc_para
+
+            # 累计有效样本数
+            valid_sample_count += 1
+
+        # ===================== 保存日志（永远记录，包含无效样本） =====================
         log_record = {
-            "sample_id": i + 1, "prompt": prompt, "original_bits": bits_for_log,
-            "clean_text": clean_text, "watermarked_text": wm_text, "paraphrased_text": paraphrased_text,
-            "generated_tokens": args.max_new_tokens,
+            "sample_id": i + 1,
+            "prompt": prompt,
+            "original_bits": bits_for_log,
+            "clean_text": clean_text,
+            "watermarked_text": wm_text,
+            "paraphrased_text": paraphrased_text,
+            
+            # ✅ 新增：实际生成的 token 数
+            "actual_generated_tokens": actual_generated_tokens,
+            "max_new_tokens": args.max_new_tokens,
+            "min_required_tokens": min_required_tokens,
+            "is_valid_sample": is_valid_sample,  # ✅ 是否有效
+
             "clean_ppl": round(ppl_base, 4) if not math.isnan(ppl_base) else 0.0,
             "wm_ppl": round(ppl_wm, 4) if not math.isnan(ppl_wm) else 0.0,
-            "bit_acc_clean": round(acc_clean, 4), "bit_acc_drop30": round(acc_drop, 4), "bit_acc_paraphrase": round(acc_para, 4)
+            "bit_acc_clean": round(acc_clean, 4),
+            "bit_acc_drop30": round(acc_drop, 4),
+            "bit_acc_paraphrase": round(acc_para, 4)
         }
         with open(args.output_log, 'a', encoding='utf-8') as f:
             f.write(json.dumps(log_record, ensure_ascii=False) + '\n')
 
-    # 总结输出
-    v = valid_ppl_count if valid_ppl_count > 0 else 1
-    print("\n" + "="*60)
+    # ===================== 最终输出：只统计有效样本 =====================
+    v = valid_sample_count if valid_sample_count > 0 else 1
+    print("\n" + "="*80)
     print(f"🌟 RESULTS (Attack: {args.attack_type.upper()}) 🌟")
+    print(f"有效样本数 / 总样本数: {valid_sample_count} / {len(prompts)}")
     print(f"Clean Bit Acc: {total_acc_clean/v*100:.2f}% | Drop Acc: {total_acc_drop/v*100:.2f}% | Para Acc: {total_acc_para/v*100:.2f}%")
     print(f"Base PPL: {total_ppl_base/v:.2f} | WM PPL: {total_ppl_wm/v:.2f}")
-    print("="*60)
+    print("="*80)
 
 if __name__ == "__main__":
     main()
