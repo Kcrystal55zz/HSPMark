@@ -43,30 +43,27 @@ class TextAttacker:
             return self._pegasus_paraphrase(text, **kwargs)
         return text
     def _dipper_paraphrase(self, text: str, lex_diversity=20, order_diversity=0, sent_interval=1, **kwargs) -> str:
-        """
-        修正版 DIPPER 改写，吸收了官方的 Prompt 格式和 100-diversity 逻辑。
-        sent_interval: 控制每次改写的句子数量（默认为 1，即严格单句改写）
-        """
-        # 1. 强制参数对齐原论文 (必须是 0, 20, 40, 60, 80, 100)
-        # DIPPER 模型内部只认识这些离散的值
         valid_diversities = [0, 20, 40, 60, 80, 100]
         lex_diversity = min(valid_diversities, key=lambda x: abs(x - lex_diversity))
         order_diversity = min(valid_diversities, key=lambda x: abs(x - order_diversity))
 
-        # 2. 最关键的 Bug 修复：参数翻转
         lex_code = 100 - lex_diversity
         order_code = 100 - order_diversity
-        print(f"lex_code / order_code: {lex_code} / {order_code}")
+        
         if sent_interval <= 0:
             chunks = [text]
         else:
-            try:
-                import nltk
-                from nltk.tokenize import sent_tokenize
-                sentences = sent_tokenize(text)
-            except Exception:
-                import re
-                sentences = re.split(r'(?<=[.!?])\s+', text)
+            # 🚀 修复1：使用和 hsp_processor.py / hsp_detector.py 完全一模一样的正则切分！
+            # 绝对不要用 NLTK，保证生成、攻击、检测三端切分逻辑 100% 咬合
+            import re
+            raw_sentences = re.split(r'([.!?\n]+)', text)
+            sentences = []
+            for i in range(0, len(raw_sentences)-1, 2):
+                s = raw_sentences[i] + raw_sentences[i+1]
+                if len(s.strip()) > 0:
+                    sentences.append(s.strip())
+            if len(raw_sentences) % 2 != 0 and len(raw_sentences[-1].strip()) > 0:
+                sentences.append(raw_sentences[-1].strip())
             
             chunks = []
             for i in range(0, len(sentences), sent_interval):
@@ -75,12 +72,9 @@ class TextAttacker:
                     chunks.append(chunk)
 
         paraphrased_chunks = []
-        
-        # 3. 引入 Context Prefix 机制 (让上一句指导下一句的改写，保留上下文连贯性)
         prefix = "" 
 
         for chunk in chunks:
-            # 拼接正确的 Prompt，加上 </sent> 闭合标签
             prompt = f"lexical = {lex_code}, order = {order_code}"
             if prefix:
                 prompt += f" {prefix}"
@@ -99,15 +93,22 @@ class TextAttacker:
                 )
             decoded_chunk = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
             
-            # 后处理：有时 DIPPER 会把输入的前缀也重复吐出来，我们需要确保只保留真正改写的部分
-            # (实践中 DIPPER 倾向于输出干净的改写句，但做个防卫)
-            if prefix and decoded_chunk.startswith(prefix):
-                decoded_chunk = decoded_chunk[len(prefix):].strip()
+            # 🚀 修复3：更鲁棒的前缀剥离（不管大小写和多余空格，只要前缀长度匹配就切除）
+            if prefix:
+                # 因为大模型可能改变标点或大小写，使用长度估算来剥离幻觉复述的前缀
+                if len(decoded_chunk) > len(prefix) and decoded_chunk[:len(prefix)//2].lower() == prefix[:len(prefix)//2].lower():
+                    decoded_chunk = decoded_chunk[len(prefix):].strip()
+
+            # 🚀 修复2：防止 DIPPER 吞标点导致检测端句子合并
+            if decoded_chunk and decoded_chunk[-1] not in ['.', '!', '?']:
+                # 寻找原文的标点，如果原文有标点，给它补上
+                last_char = chunk.strip()[-1] if chunk.strip() else '.'
+                if last_char in ['.', '!', '?']:
+                    decoded_chunk += last_char
+                else:
+                    decoded_chunk += '.'
 
             paraphrased_chunks.append(decoded_chunk)
-            
-            # 将当前未改写的原文（或改写后的句子）作为下一个块的 Prefix
-            # 这里我们用原文作为 prefix 以防止错误累加
             prefix = chunk 
 
         return " ".join(paraphrased_chunks)
