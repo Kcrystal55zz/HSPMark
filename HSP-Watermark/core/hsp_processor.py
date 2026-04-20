@@ -4,9 +4,6 @@ import re
 from transformers import LogitsProcessor
 import nltk
 
-# 确保 nltk punkt 已下载 (可在外部初始化时运行)
-# nltk.download('punkt', quiet=True)
-
 class SemanticOrthogonalLogitsProcessor(LogitsProcessor):
     def __init__(self, sentence_model, mlp_net, llm_tokenizer, message: torch.Tensor, alpha=2.0, top_k=50, window_size=2):
         self.sentence_model = sentence_model
