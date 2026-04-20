@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--drop_ratio", type=float, default=0.1, help="删词攻击的比例")
     
     # DIPPER 专用参数
-    parser.add_argument("--lex_diversity", type=int, default=20, help="DIPPER: 词汇多样性 (0-100)")
+    parser.add_argument("--lex_diversity", type=int, default=60, help="DIPPER: 词汇多样性 (0-100)")
     parser.add_argument("--order_diversity", type=int, default=0, help="DIPPER: 句法打乱程度 (0-100)")
     
     # Pegasus 专用参数
