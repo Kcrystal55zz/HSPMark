@@ -21,7 +21,6 @@ import collections
 from math import sqrt, ceil  
 import time
 import scipy.stats
-import numpy as np 
 import torch 
 from torch import Tensor
 from tokenizers import Tokenizer

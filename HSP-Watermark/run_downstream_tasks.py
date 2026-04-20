@@ -3,7 +3,6 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
 
-import random
 import torch
 import argparse
 from tqdm import tqdm
@@ -177,6 +176,7 @@ def create_hspmark_processor(tokenizer, device, args):
 
 def create_stealthink_processor(tokenizer, device, args):
     """Create a fresh Stealthink watermark logits processor (call once per generation)."""
+    import random
     from baselines.stealthink import ReweightProcessor, ReweightLogitsProcessor
 
     chunk_capacity = args.chunk_capacity

@@ -4,7 +4,6 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
-import random
 import torch
 import math
 import argparse
@@ -231,6 +230,7 @@ def run_hspmark_experiments(args):
 
 
 def run_stealthink_experiments(args):
+    import random
     from baselines.stealthink import (
         ReweightProcessor, ReweightLogitsProcessor, DetectorProcessor,
         _compute_norm_p_val, hamming_distance,
