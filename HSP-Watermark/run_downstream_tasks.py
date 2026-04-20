@@ -3,6 +3,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
 
+import random
 import torch
 import argparse
 from tqdm import tqdm
@@ -17,6 +18,8 @@ from core.hsp_processor import SemanticOrthogonalLogitsProcessor
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HSP-Watermark Downstream Tasks Evaluation")
+    parser.add_argument("--method", type=str, default="hspmark", choices=["hspmark", "stealthink"],
+                        help="Watermarking method to evaluate: 'hspmark' (default) or 'stealthink'")
     # 标准任务专属模型
     parser.add_argument("--sum_model_name", type=str, default="facebook/bart-large-cnn")
     parser.add_argument("--trans_model_name", type=str, default="facebook/mbart-large-50-many-to-many-mmt")
@@ -27,6 +30,11 @@ def parse_args():
 
     parser.add_argument("--num_samples", type=int, default=50)
     parser.add_argument("--max_new_tokens", type=int, default=200)  # 摘要任务增加生成长度
+
+    # Stealthink-specific parameters
+    parser.add_argument("--msg_len", type=int, default=24, help="Stealthink: total embedded bits")
+    parser.add_argument("--chunk_capacity", type=int, default=1, help="Stealthink: bits per chunk (symbol capacity)")
+
     return parser.parse_args()
 
 
@@ -38,13 +46,12 @@ def load_metrics():
     return rouge, bleu, bertscore
 
 
-def generate_text(model, tokenizer, prompt, max_new_tokens, processor=None):
+def generate_text(model, tokenizer, prompt, max_new_tokens, get_processor=None):
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
-    prompt_len = inputs.input_ids.shape[1]
 
     processors = LogitsProcessorList()
-    if processor is not None:
-        processors.append(processor)
+    if get_processor is not None:
+        processors.append(get_processor())
 
     with torch.no_grad():
         outputs = model.generate(
@@ -61,7 +68,7 @@ def generate_text(model, tokenizer, prompt, max_new_tokens, processor=None):
     return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
-def evaluate_summarization(model, tokenizer, wm_processor, metrics, num_samples, max_new_tokens):
+def evaluate_summarization(model, tokenizer, get_wm_processor, metrics, num_samples, max_new_tokens):
     print("\n" + "="*50)
     print("文本摘要任务 | 模型: facebook/bart-large-cnn")
     print("="*50)
@@ -79,8 +86,8 @@ def evaluate_summarization(model, tokenizer, wm_processor, metrics, num_samples,
         prompt = article[:1024]  # BART输入限制1024token
         reference = item["highlights"]
 
-        gen_clean = generate_text(model, tokenizer, prompt, max_new_tokens, processor=None)
-        gen_wm = generate_text(model, tokenizer, prompt, max_new_tokens, processor=wm_processor)
+        gen_clean = generate_text(model, tokenizer, prompt, max_new_tokens, get_processor=None)
+        gen_wm = generate_text(model, tokenizer, prompt, max_new_tokens, get_processor=get_wm_processor)
 
         preds_clean.append(gen_clean)
         preds_wm.append(gen_wm)
@@ -102,7 +109,7 @@ def evaluate_summarization(model, tokenizer, wm_processor, metrics, num_samples,
     print(f"BERTScore F1 | 无水印: {clean_f1:.4f} | 有水印: {wm_f1:.4f}")
 
 
-def evaluate_translation(model, tokenizer, wm_processor, metrics, num_samples, max_new_tokens):
+def evaluate_translation(model, tokenizer, get_wm_processor, metrics, num_samples, max_new_tokens):
     print("\n" + "="*50)
     print("机器翻译任务 | 模型: facebook/mbart-large-50-many-to-many-mmt")
     print("="*50)
@@ -121,12 +128,12 @@ def evaluate_translation(model, tokenizer, wm_processor, metrics, num_samples, m
     for item in tqdm(dataset):
         ro_text = item["translation"]["ro"]
         en_ref = item["translation"]["en"]
-        
+
         # mBART微调模型直接输入源文本
         prompt = ro_text
 
-        gen_clean = generate_text(model, tokenizer, prompt, max_new_tokens, processor=None)
-        gen_wm = generate_text(model, tokenizer, prompt, max_new_tokens, processor=wm_processor)
+        gen_clean = generate_text(model, tokenizer, prompt, max_new_tokens, get_processor=None)
+        gen_wm = generate_text(model, tokenizer, prompt, max_new_tokens, get_processor=get_wm_processor)
 
         preds_clean.append(gen_clean)
         preds_wm.append(gen_wm)
@@ -146,8 +153,8 @@ def evaluate_translation(model, tokenizer, wm_processor, metrics, num_samples, m
     print(f"BERTScore F1 | 无水印: {clean_f1:.4f} | 有水印: {wm_f1:.4f}")
 
 
-def create_watermark_processor(tokenizer, device, args):
-    """为每个模型创建独立的水印处理器"""
+def create_hspmark_processor(tokenizer, device, args):
+    """Create the HSPMark watermark logits processor."""
     sent_model = SentenceTransformer('all-MiniLM-L6-v2').to(device)
     mlp = RobustSemanticMLP(input_dim=384, hidden_dim=256, output_dim=128).to(device)
 
@@ -168,6 +175,32 @@ def create_watermark_processor(tokenizer, device, args):
     )
 
 
+def create_stealthink_processor(tokenizer, device, args):
+    """Create a fresh Stealthink watermark logits processor (call once per generation)."""
+    from baselines.stealthink import ReweightProcessor, ReweightLogitsProcessor
+
+    chunk_capacity = args.chunk_capacity
+    msg_len = args.msg_len
+    num_value = 2 ** chunk_capacity
+    R = 1.0 / num_value
+    converted_msg_length = int(msg_len / chunk_capacity)
+    n_gram_len = 3
+
+    vocab = list(tokenizer.get_vocab().values())
+    reweight_processor = ReweightProcessor(vocab=vocab)
+
+    embedded_message = [random.randint(0, num_value - 1) for _ in range(converted_msg_length)]
+
+    return ReweightLogitsProcessor(
+        reweight_processor,
+        embedded_message=embedded_message,
+        n_gram_len=n_gram_len,
+        R=R,
+        converted_msg_length=converted_msg_length,
+        seen_seeds=set()
+    )
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -179,11 +212,18 @@ def main():
     sum_model = AutoModelForSeq2SeqLM.from_pretrained(args.sum_model_name).to(device)
     sum_model.eval()
 
-    sum_wm = create_watermark_processor(sum_tokenizer, device, args)
-    evaluate_summarization(sum_model, sum_tokenizer, sum_wm, metrics, args.num_samples, args.max_new_tokens)
+    if args.method == "hspmark":
+        sum_wm = create_hspmark_processor(sum_tokenizer, device, args)
+        get_sum_processor = lambda: sum_wm
+    else:
+        get_sum_processor = lambda: create_stealthink_processor(sum_tokenizer, device, args)
+
+    evaluate_summarization(sum_model, sum_tokenizer, get_sum_processor, metrics, args.num_samples, args.max_new_tokens)
 
     # 释放显存
-    del sum_model, sum_tokenizer, sum_wm
+    del sum_model, sum_tokenizer
+    if args.method == "hspmark":
+        del sum_wm
     torch.cuda.empty_cache()
 
     # ===================== 翻译模型 (mBART-Large-50) =====================
@@ -192,8 +232,13 @@ def main():
     trans_model = AutoModelForSeq2SeqLM.from_pretrained(args.trans_model_name).to(device)
     trans_model.eval()
 
-    trans_wm = create_watermark_processor(trans_tokenizer, device, args)
-    evaluate_translation(trans_model, trans_tokenizer, trans_wm, metrics, args.num_samples, args.max_new_tokens)
+    if args.method == "hspmark":
+        trans_wm = create_hspmark_processor(trans_tokenizer, device, args)
+        get_trans_processor = lambda: trans_wm
+    else:
+        get_trans_processor = lambda: create_stealthink_processor(trans_tokenizer, device, args)
+
+    evaluate_translation(trans_model, trans_tokenizer, get_trans_processor, metrics, args.num_samples, args.max_new_tokens)
 
 
 if __name__ == "__main__":
